@@ -1,0 +1,26 @@
+name: Backup automático do CRM
+
+on:
+  push:
+    branches: [main]
+    paths: ['index.html']
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Salvar cópia datada
+        run: |
+          mkdir -p backups
+          DATA=$(date +'%Y-%m-%d_%H-%M')
+          cp index.html "backups/index_${DATA}.html"
+
+      - name: Commitar backup
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add backups/
+          git commit -m "Backup automático $(date +'%Y-%m-%d %H:%M')" || echo "Nada novo pra commitar"
+          git push
