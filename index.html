@@ -1405,32 +1405,113 @@
             return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
         }
 
+        // Valida o dígito verificador do código de barras (módulo 11) — evita ler número errado
+        function dvBarrasOk(barras) {
+            if (!/^\d{44}$/.test(barras)) return false;
+            const dv = parseInt(barras[4], 10);
+            const semDv = barras.slice(0, 4) + barras.slice(5);
+            let peso = 2, soma = 0;
+            for (let i = semDv.length - 1; i >= 0; i--) {
+                soma += parseInt(semDv[i], 10) * peso;
+                peso = peso === 9 ? 2 : peso + 1;
+            }
+            const resto = soma % 11;
+            let calc = 11 - resto;
+            if (calc === 0 || calc === 10 || calc === 11) calc = 1;
+            return calc === dv;
+        }
+
+        // Converte linha digitável (47 dígitos) em código de barras (44)
+        function linhaParaBarras(l) {
+            if (!/^\d{47}$/.test(l)) return '';
+            return l.slice(0, 4) + l.slice(32, 33) + l.slice(33, 47) + l.slice(4, 9) + l.slice(10, 20) + l.slice(21, 31);
+        }
+
+        // Rejeita leituras implausíveis (sequência aleatória que passou no DV por acaso)
+        function boletoPlausivel(valor, vencIso) {
+            if (valor != null && (valor <= 0 || valor > 5000000)) return false;
+            if (vencIso) {
+                const ano = parseInt(vencIso.slice(0, 4), 10);
+                const atual = new Date().getFullYear();
+                if (ano < atual - 3 || ano > atual + 3) return false;
+            }
+            return true;
+        }
+
         function extrairDadosDoTexto(texto) {
             const dados = {};
-            const m = texto.match(/(\d{5})[.\s]?(\d{5})\s{0,3}(\d{5})[.\s]?(\d{6})\s{0,3}(\d{5})[.\s]?(\d{6})\s{0,3}(\d)\s{0,3}(\d{14})/);
-            if (m) {
-                dados.linhaDigitavel = `${m[1]}.${m[2]} ${m[3]}.${m[4]} ${m[5]}.${m[6]} ${m[7]} ${m[8]}`;
-                const campoLivre = m[8];
-                const fator = parseInt(campoLivre.slice(0, 4), 10);
-                const valorCent = parseInt(campoLivre.slice(4), 10);
-                if (valorCent > 0) dados.valor = valorCent / 100;
-                const venc = calcularVencimentoPorFator(fator);
-                if (venc) dados.vencimento = isoDate(venc);
-            } else {
-                const semSep = texto.replace(/[.\s]/g, '');
-                const g = semSep.match(/8\d{47}/);
-                if (g) dados.linhaDigitavel = g[0];
+            // 1) Fluxo de dígitos: junta tudo e procura sequências válidas.
+            //    Resolve PDFs em que o número vem quebrado em pedaços.
+            const fluxo = texto.replace(/[^\d]/g, '');
+            const testados = new Set();
+            // 1a) Linha digitável bancária: 47 dígitos
+            for (let i = 0; i + 47 <= fluxo.length; i++) {
+                const cand = fluxo.substr(i, 47);
+                if (testados.has(cand)) continue;
+                testados.add(cand);
+                const barras = linhaParaBarras(cand);
+                if (barras && dvBarrasOk(barras)) {
+                    const fator = parseInt(cand.slice(33, 37), 10);
+                    const valorCent = parseInt(cand.slice(37), 10);
+                    const val = valorCent > 0 ? valorCent / 100 : null;
+                    const venc = calcularVencimentoPorFator(fator);
+                    const vIso = venc ? isoDate(venc) : '';
+                    if (!boletoPlausivel(val, vIso)) continue; // provável falso positivo
+                    dados.linhaDigitavel = `${cand.slice(0,5)}.${cand.slice(5,10)} ${cand.slice(10,15)}.${cand.slice(15,21)} ${cand.slice(21,26)}.${cand.slice(26,32)} ${cand.slice(32,33)} ${cand.slice(33)}`;
+                    if (val) dados.valor = val;
+                    if (vIso) dados.vencimento = vIso;
+                    break;
+                }
             }
+            // 1b) Código de barras solto: 44 dígitos
+            if (!dados.linhaDigitavel) {
+                for (let i = 0; i + 44 <= fluxo.length; i++) {
+                    const cand = fluxo.substr(i, 44);
+                    if (dvBarrasOk(cand)) {
+                        const fator = parseInt(cand.slice(5, 9), 10);
+                        const valorCent = parseInt(cand.slice(9, 19), 10);
+                        const val = valorCent > 0 ? valorCent / 100 : null;
+                        const venc = calcularVencimentoPorFator(fator);
+                        const vIso = venc ? isoDate(venc) : '';
+                        if (!boletoPlausivel(val, vIso)) continue;
+                        if (val) dados.valor = val;
+                        if (vIso) dados.vencimento = vIso;
+                        dados.linhaDigitavel = cand;
+                        break;
+                    }
+                }
+            }
+            // 1c) Guia de arrecadação / concessionária: 48 dígitos começando com 8
+            if (!dados.linhaDigitavel) {
+                const g = fluxo.match(/8[1-4]\d{46}/);
+                if (g) {
+                    const l = g[0];
+                    dados.linhaDigitavel = l.replace(/(\d{11}\d)(?=\d)/g, '$1 ').trim();
+                    const cent = parseInt(l.slice(4, 15), 10);
+                    if (cent > 0 && cent < 99999999) dados.valor = cent / 100;
+                    dados.guiaArrecadacao = true;
+                }
+            }
+            // 2) Fallback: rótulos no texto (quando o número não pôde ser lido)
             if (!dados.vencimento) {
-                const mv = texto.match(/[Vv]encimento[:.\s]*?(\d{2})[\/.\-](\d{2})[\/.\-](\d{4})/);
+                const mv = texto.match(/(?:[Vv]enc(?:imento)?|[Pp]agar\s+at[ée]|[Dd]ata\s+de\s+[Vv]enc\w*)\s*[:.\s]*(\d{2})[\/.\-](\d{2})[\/.\-](\d{4})/);
                 if (mv) dados.vencimento = `${mv[3]}-${mv[2]}-${mv[1]}`;
+                else {
+                    const md = texto.match(/(\d{2})[\/.\-](\d{2})[\/.\-](\d{4})/);
+                    if (md) dados.vencimento = `${md[3]}-${md[2]}-${md[1]}`;
+                }
             }
             if (!dados.valor) {
-                const mval = texto.match(/[Vv]alor\s*(?:do\s*)?[Dd]ocumento[:.\s]*?(?:R\$\s*)?([\d.]{1,12},\d{2})/);
+                const mval = texto.match(/(?:[Vv]alor\s*(?:do\s*)?(?:[Dd]ocumento|[Cc]obran[çc]a|[Tt]otal|a\s+[Pp]agar)?)\s*[:.\s]*(?:R\$\s*)?([\d.]{1,12},\d{2})/);
                 if (mval) dados.valor = parseFloat(mval[1].replace(/\./g, '').replace(',', '.'));
+                else {
+                    // Maior valor monetário do documento costuma ser o total
+                    const todos = [...texto.matchAll(/R\$\s*([\d.]{1,12},\d{2})/g)].map((x) => parseFloat(x[1].replace(/\./g, '').replace(',', '.')));
+                    if (todos.length) dados.valor = Math.max(...todos);
+                }
             }
-            const mb = texto.match(/(?:[Bb]enefici[áa]rio|[Cc]edente)(?:\s*[Ff]inal)?[:.\s]*([A-ZÀ-Ú][A-Za-zÀ-ú0-9&.,\- ]{3,55})/);
-            if (mb) dados.beneficiario = mb[1].replace(/\s{2,}/g, ' ').trim();
+            const mb = texto.match(/(?:[Bb]enefici[áa]rio|[Cc]edente|[Rr]az[ãa]o\s+[Ss]ocial)(?:\s*[Ff]inal)?\s*[:.\s]*([A-ZÀ-Ú][A-Za-zÀ-ú0-9&.,\-\/ ]{3,55})/);
+            if (mb) dados.beneficiario = mb[1].replace(/\s{2,}/g, ' ').replace(/\s*(CNPJ|CPF).*$/i, '').trim();
             return dados;
         }
 
@@ -1684,23 +1765,48 @@
         const chaveMov = (m) => m.data + '|' + m.valor.toFixed(2) + '|' + m.descricao.slice(0, 24).toLowerCase();
 
         async function extrairDadosBoletoPDF(file) {
-            if (!window.pdfjsLib) return {};
+            if (!window.pdfjsLib) return { erro: 'leitor-indisponivel' };
             try {
                 const buf = await file.arrayBuffer();
                 const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
-                let texto = '';
-                const paginas = Math.min(pdf.numPages, 4);
+                const paginas = Math.min(pdf.numPages, 6);
+                let comEspaco = '', semEspaco = '';
+                let totalItens = 0;
                 for (let i = 1; i <= paginas; i++) {
                     const page = await pdf.getPage(i);
                     const tc = await page.getTextContent();
-                    texto += tc.items.map((it) => it.str).join(' ') + '\n';
+                    totalItens += tc.items.length;
+                    comEspaco += tc.items.map((it) => it.str).join(' ') + '\n';
+                    semEspaco += tc.items.map((it) => it.str).join('') + '\n'; // number split across items
                 }
-                return extrairDadosDoTexto(texto);
+                // PDF sem camada de texto = digitalizado/imagem: pdf.js não tem o que ler
+                if (totalItens === 0 || comEspaco.replace(/\s/g, '').length < 20) {
+                    return { erro: 'pdf-imagem' };
+                }
+                let dados = extrairDadosDoTexto(comEspaco);
+                if (!dados.linhaDigitavel) {
+                    const alt = extrairDadosDoTexto(semEspaco);
+                    // Mantém o melhor dos dois
+                    dados = {
+                        ...dados,
+                        ...Object.fromEntries(Object.entries(alt).filter(([k, v]) => v != null && dados[k] == null)),
+                        ...(alt.linhaDigitavel ? { linhaDigitavel: alt.linhaDigitavel } : {}),
+                    };
+                }
+                if (!dados.linhaDigitavel && !dados.valor && !dados.vencimento) dados.erro = 'sem-dados';
+                return dados;
             } catch (err) {
                 console.warn('Falha ao ler PDF:', err);
-                return {};
+                return { erro: 'pdf-invalido' };
             }
         }
+
+        const MSG_ERRO_BOLETO = {
+            'pdf-imagem': '📷 Este PDF é uma imagem digitalizada (sem texto). Baixe o boleto original do banco/fornecedor em PDF, ou preencha os campos manualmente.',
+            'sem-dados': '🔍 Não encontrei linha digitável nem valor neste PDF. Confira se é mesmo um boleto e preencha manualmente se precisar.',
+            'pdf-invalido': '⚠️ Não consegui abrir este PDF (pode estar protegido por senha ou corrompido).',
+            'leitor-indisponivel': '⚠️ Leitor de PDF indisponível — verifique sua conexão e recarregue a página.',
+        };
 
         /* ══════════ Utilidades ══════════ */
         const arred = (v) => Math.round(((parseFloat(v) || 0) + Number.EPSILON) * 100) / 100;
@@ -1784,6 +1890,7 @@
             const [boletoFile, setBoletoFile] = useState(null);
             const [extraindo, setExtraindo] = useState(false);
             const [dadosExtraidos, setDadosExtraidos] = useState(null);
+            const [erroBoleto, setErroBoleto] = useState('');
             const [toast, setToast] = useState('');
             const [mesAtual, setMesAtual] = useState(new Date());
             const [busca, setBusca] = useState('');
@@ -2352,6 +2459,7 @@
                 setForm({ ...FORM_VAZIO, vencimento: hojeISO() });
                 setBoletoFile(null);
                 setDadosExtraidos(null);
+                setErroBoleto('');
                 setModalAberto(true);
             };
 
@@ -2373,6 +2481,7 @@
                 });
                 setBoletoFile(null);
                 setDadosExtraidos(null);
+                setErroBoleto('');
                 setModalAberto(true);
             };
 
@@ -2661,6 +2770,12 @@
                     setExtraindo(true);
                     const dados = await extrairDadosBoletoPDF(file);
                     setExtraindo(false);
+                    if (dados.erro) {
+                        setErroBoleto(MSG_ERRO_BOLETO[dados.erro] || 'Não consegui ler este PDF.');
+                        mostrarToast('📎 PDF anexado — preencha os campos manualmente');
+                        return;
+                    }
+                    setErroBoleto('');
                     if (Object.keys(dados).length) {
                         setDadosExtraidos(dados);
                         setForm((f) => ({
@@ -2701,6 +2816,8 @@
                     if (file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')) {
                         dados = await extrairDadosBoletoPDF(file);
                     }
+                    const motivoErro = dados.erro ? (MSG_ERRO_BOLETO[dados.erro] || '') : '';
+                    if (dados.erro) dados = {};
                     const completo = !!(dados.valor && dados.vencimento);
                     itens.push({
                         chave: 'rev-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7),
@@ -2708,6 +2825,7 @@
                         incluir: true,
                         duplicada: pareceDuplicada(dados),
                         completo,
+                        motivoErro,
                         form: {
                             fornecedor: dados.beneficiario || file.name.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ').slice(0, 40),
                             valor: dados.valor ? String(dados.valor) : '',
@@ -3145,32 +3263,63 @@
                 const contasL = contaLista.map((c) => ({ ...c }));
                 const movsL = movLista.map((m) => ({ ...m }));
                 let marcadas = 0, vinculos = 0;
+
+                // Índices por valor (em centavos) — evita varrer todas as contas para cada movimento
+                const idxPagas = new Map();
+                const idxAbertas = [];
+                contasL.forEach((c) => {
+                    if (c.movConciliado) return;
+                    if (c.status === 'pago') {
+                        const cent = Math.round(arred(c.valorPago != null ? c.valorPago : c.valor) * 100);
+                        if (!idxPagas.has(cent)) idxPagas.set(cent, []);
+                        idxPagas.get(cent).push(c);
+                    } else {
+                        idxAbertas.push(c);
+                    }
+                });
+                // Abertas ordenadas por valor: permite busca binária por faixa
+                idxAbertas.sort((a, b) => a.valor - b.valor);
+                const buscaInicio = (min) => {
+                    let lo = 0, hi = idxAbertas.length;
+                    while (lo < hi) { const mid = (lo + hi) >> 1; if (idxAbertas[mid].valor < min) lo = mid + 1; else hi = mid; }
+                    return lo;
+                };
+
                 movsL.forEach((m) => {
                     if (m.valor >= 0 || m.conciliadoCom) return;
                     const alvo = arred(Math.abs(m.valor));
-                    // 1º: conta já paga com o mesmo valor, até 3 dias de diferença (nome dá bônus)
-                    const jaPagas = contasL.filter((c) =>
-                        !c.movConciliado && c.status === 'pago' &&
-                        Math.abs(arred(c.valorPago != null ? c.valorPago : c.valor) - alvo) <= 0.01 &&
-                        paraISO(c.pagaEm || c.vencimento) && difDias(paraISO(c.pagaEm || c.vencimento), m.data) <= 3
-                    );
-                    let c = jaPagas.find((x) => nomeBateComMov(x, m)) || jaPagas[0];
+                    const cent = Math.round(alvo * 100);
+                    let c = null;
+
+                    // 1º: conta já paga com o mesmo valor, até 3 dias de diferença
+                    const candPagas = idxPagas.get(cent);
+                    if (candPagas && candPagas.length) {
+                        const validas = candPagas.filter((x) => {
+                            if (x.movConciliado) return false;
+                            const dp = paraISO(x.pagaEm || x.vencimento);
+                            return dp && difDias(dp, m.data) <= 3;
+                        });
+                        c = validas.find((x) => nomeBateComMov(x, m)) || validas[0] || null;
+                    }
+
                     // 2º: conta em aberto — o extrato prova o pagamento e dá baixa sozinho
                     if (!c) {
-                        const candidatas = contasL.filter((c) => {
-                            if (c.movConciliado || c.status === 'pago') return false;
-                            if (alvo < c.valor - 0.01 || alvo > c.valor * 1.2 + 0.01) return false;
-                            const v = paraISO(c.vencimento);
-                            if (!v) return false;
+                        // Só contas cujo valor esteja entre alvo/1.2 e alvo (pagamento >= valor original)
+                        let i = buscaInicio(alvo / 1.2 - 0.01);
+                        let melhor = null, melhorScore = Infinity;
+                        for (; i < idxAbertas.length; i++) {
+                            const x = idxAbertas[i];
+                            if (x.valor > alvo + 0.01) break; // ordenado: daqui pra frente todos maiores
+                            if (x.movConciliado || x.status === 'pago') continue;
+                            if (alvo > x.valor * 1.2 + 0.01) continue;
+                            const v = paraISO(x.vencimento);
+                            if (!v) continue;
                             const d = (new Date(m.data + 'T12:00') - new Date(v + 'T12:00')) / 86400000;
-                            return d >= -5 && d <= 60;
-                        }).map((c) => {
-                            const bateNome = nomeBateComMov(c, m);
-                            const difValor = Math.abs(c.valor - alvo);
-                            // Score: nome vale mais que proximidade de valor
-                            return { c, score: (bateNome ? 0 : 1000) + difValor };
-                        }).sort((a, b) => a.score - b.score);
-                        c = candidatas.length ? candidatas[0].c : null;
+                            if (d < -5 || d > 60) continue;
+                            const score = (nomeBateComMov(x, m) ? 0 : 1000) + Math.abs(x.valor - alvo);
+                            if (score < melhorScore) { melhorScore = score; melhor = x; }
+                        }
+                        c = melhor;
                         if (c) {
                             c.status = 'pago';
                             c.valorPago = alvo;
@@ -3418,6 +3567,25 @@
             }, [caixa.movs, mesAtual, buscaMov, periodoCaixa, filtroCatMov]);
 
             const rotuloPeriodo = periodoCaixa === 'ano' ? String(mesAtual.getFullYear()) : null;
+
+            // Saldo do extrato: último lançamento que trouxe saldo (o banco é a fonte da verdade)
+            const saldoDoExtrato = useMemo(() => {
+                const comSaldo = (caixa.movs || []).filter((m) => m.saldo != null);
+                if (!comSaldo.length) return null;
+                const maxData = comSaldo.reduce((mx, m) => (m.data > mx ? m.data : mx), '');
+                const doDia = comSaldo.filter((m) => m.data === maxData);
+                const ult = doDia[doDia.length - 1];
+                return { valor: arred(ult.saldo), data: ult.data };
+            }, [caixa.movs]);
+
+            const saldoDivergente = saldoDoExtrato && caixa.saldoAtual != null
+                && Math.abs(arred(caixa.saldoAtual) - saldoDoExtrato.valor) > 0.01;
+
+            const usarSaldoDoExtrato = () => {
+                if (!saldoDoExtrato) return;
+                setCaixa((cx) => ({ ...cx, saldoAtual: saldoDoExtrato.valor, saldoData: saldoDoExtrato.data }));
+                mostrarToast('🏦 Saldo ajustado pelo extrato');
+            };
 
             const entradasMes = movsDoMes.filter((m) => m.valor > 0).reduce((s, m) => s + m.valor, 0);
             const saidasMes = movsDoMes.filter((m) => m.valor < 0).reduce((s, m) => s + Math.abs(m.valor), 0);
@@ -3824,7 +3992,7 @@
                                         </div>
                                         <div className="stat-value">R$ {fmtValor(totalPendente)}</div>
                                         <div>
-                                            <div className="stat-desc">{contasDoMes.filter((c) => c.status !== 'pago').length} em aberto</div>
+                                            <div className="stat-desc">{contasDoMes.filter((c) => c.status !== 'pago').length} em aberto{vencidas.length > 0 ? ` · inclui ${vencidas.length} vencida${vencidas.length > 1 ? 's' : ''}` : ''}</div>
                                             <div className="stat-hint">Tocar para ver relatório ›</div>
                                         </div>
                                     </div>
@@ -3835,7 +4003,7 @@
                                         </div>
                                         <div className="stat-value">R$ {fmtValor(totalVencido)}</div>
                                         <div>
-                                            <div className="stat-desc">{vencidas.length === 0 ? 'Tudo em dia 🎉' : `${vencidas.length} exigem atenção`}</div>
+                                            <div className="stat-desc">{vencidas.length === 0 ? 'Tudo em dia 🎉' : `${vencidas.length} exigem atenção · já contadas em "A pagar"`}</div>
                                             <div className="stat-hint">Tocar para ver relatório ›</div>
                                         </div>
                                     </div>
@@ -4056,6 +4224,20 @@
                                     </div>
                                 )}
 
+                                {saldoDivergente && (
+                                    <div className="data-section" style={{ border: '1.5px solid rgba(255,149,0,0.45)' }}>
+                                        <div className="alerta-revisao" style={{ marginBottom: '10px' }}>
+                                            ⚠️ <b>O saldo informado não bate com o extrato.</b><br />
+                                            Você informou <b>R$ {fmtValor(caixa.saldoAtual)}</b>, mas o último lançamento do extrato ({fmtData(saldoDoExtrato.data)}) fecha em <b>R$ {fmtValor(saldoDoExtrato.valor)}</b>.
+                                            A projeção usa o saldo informado — corrija para ela ficar confiável.
+                                        </div>
+                                        <div className="btn-group" style={{ paddingBottom: '10px' }}>
+                                            <button className="btn-sm primary" onClick={usarSaldoDoExtrato}>🏦 Usar o saldo do extrato (R$ {fmtValor(saldoDoExtrato.valor)})</button>
+                                            <button className="btn-sm" onClick={() => { setSaldoEditando(true); setSaldoTxt(String(caixa.saldoAtual != null ? caixa.saldoAtual : '')); }}>✏️ Informar outro</button>
+                                        </div>
+                                    </div>
+                                )}
+
                                 {/* Projeção 90 dias */}
                                 <div className="data-section">
                                     <div className="section-header">
@@ -4074,6 +4256,11 @@
                                         </div>
                                     ) : (
                                         <>
+                                            {saldoDivergente && (
+                                                <div className="alerta-revisao" style={{ marginBottom: '10px' }}>
+                                                    ⚠️ Projeção baseada em saldo que diverge do extrato — trate o aviso acima antes de confiar nestes números.
+                                                </div>
+                                            )}
                                             {projecao.diaNegativo >= 0 ? (
                                                 <div className="alerta-revisao" style={{ background: 'rgba(255,59,48,0.1)', borderColor: 'rgba(255,59,48,0.35)', color: '#B91C1C' }}>
                                                     🚨 <b>Atenção:</b> nesta projeção o caixa fica negativo em <b>{dataDoDia(projecao.diaNegativo)}</b> ({projecao.diaNegativo === 0 ? 'hoje' : 'daqui a ' + projecao.diaNegativo + ' dias'}). Menor saldo: <b>R$ {fmtValor(projecao.minimo)}</b> em {dataDoDia(projecao.diaMinimo)}.
@@ -5052,6 +5239,12 @@
                                             <button className="icon-btn" onClick={() => { setBoletoFile(null); setDadosExtraidos(null); }}>✕</button>
                                         </div>
                                     )}
+                                    {erroBoleto && (
+                                        <div className="extracao-preview" style={{ background: 'rgba(255,149,0,0.1)' }}>
+                                            <div className="tit" style={{ color: '#B45309' }}>Não consegui ler automaticamente</div>
+                                            <div style={{ fontWeight: 600, color: 'var(--texto-sec)', lineHeight: 1.5 }}>{erroBoleto}</div>
+                                        </div>
+                                    )}
                                     {dadosExtraidos && (
                                         <div className="extracao-preview">
                                             <div className="tit">🤖 Extraído automaticamente</div>
@@ -5608,7 +5801,7 @@
                                             <div className="rev-arquivo">📕 {it.file.name}</div>
                                             <div className="rev-flags">
                                                 {it.duplicada && <span className="badge juros">⚠️ possível duplicada</span>}
-                                                {!it.completo && <span className="badge pendente">🔍 conferir dados</span>}
+                                                {!it.completo && <span className="badge pendente" title={it.motivoErro || 'Alguns campos não foram lidos'}>🔍 conferir dados</span>}
                                                 {it.completo && !it.duplicada && <span className="badge pago">🤖 leitura ok</span>}
                                             </div>
                                         </div>
