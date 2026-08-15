@@ -2191,6 +2191,51 @@
                 } catch (e) { return null; }
             };
 
+            // Liga o ouvinte do Firestore (usado tanto no login manual quanto na reconexão automática)
+            const ativarSincronizacao = (emailAtivo) => {
+                fbRef.current.db = firebase.firestore();
+                const docRef = fbRef.current.db.collection('crm-financeiro').doc('dados');
+                if (fbRef.current.unsub) fbRef.current.unsub();
+                fbRef.current.unsub = docRef.onSnapshot((snap) => {
+                    const dados = snap.data();
+                    if (dados && dados.contas) {
+                        const remoto = JSON.stringify({ c: dados.contas, x: dados.caixa || null, g: dados.categorias || [], r: dados.receber || [], q: dados.regras || [], f: dados.fechados || [], t: dados.tipos || [] });
+                        const local = JSON.stringify({ c: contasRef.current, x: caixaRef.current, g: categoriasRef.current, r: receberRef.current, q: regrasRef.current, f: fechadosRef.current, t: tiposRef.current });
+                        fbRef.current.ultimoRemoto = remoto;
+                        if (remoto !== local) {
+                            fbRef.current.aplicandoRemoto = true;
+                            setContas(dados.contas);
+                            if (dados.caixa) setCaixa(dados.caixa);
+                            if (dados.categorias) setCategoriasCustom(dados.categorias);
+                            if (dados.receber) setReceber(dados.receber);
+                            if (dados.regras) setRegras(dados.regras);
+                            if (dados.fechados) setMesesFechados(dados.fechados);
+                            if (dados.tipos) setTiposCustom(dados.tipos);
+                        }
+                    }
+                }, () => setFb((f) => ({ ...f, erro: 'Sem permissão no Firestore — confira as regras' })));
+                setFb({ conectado: true, email: emailAtivo, erro: '' });
+            };
+
+            // Reconexão automática: se já houve login neste aparelho, o Firebase mantém a sessão
+            useEffect(() => {
+                if (!fbConfigTxt || fbConfigTxt.length < 30 || typeof firebase === 'undefined') return;
+                const cfg = parsearConfigFb(fbConfigTxt);
+                if (!cfg || !cfg.projectId) return;
+                try {
+                    if (!fbRef.current.app) {
+                        fbRef.current.app = firebase.apps.length ? firebase.app() : firebase.initializeApp(cfg);
+                    }
+                    const un = firebase.auth().onAuthStateChanged((user) => {
+                        if (user && !fbRef.current.unsub) {
+                            ativarSincronizacao(user.email || fbEmail);
+                            mostrarToast('☁️ Sincronização reconectada');
+                        }
+                    });
+                    return () => un();
+                } catch (e) { /* silencioso: usuário conecta manualmente */ }
+            }, []);
+
             const conectarFirebase = async () => {
                 const cfg = parsearConfigFb(fbConfigTxt);
                 if (!cfg || !cfg.projectId) {
@@ -2205,6 +2250,7 @@
                     if (!fbRef.current.app) {
                         fbRef.current.app = firebase.apps.length ? firebase.app() : firebase.initializeApp(cfg);
                     }
+                    try { await firebase.auth().setPersistence(firebase.auth.Auth.Persistence.LOCAL); } catch (e) {}
                     await firebase.auth().signInWithEmailAndPassword(fbEmail, fbSenha);
                     fbRef.current.db = firebase.firestore();
                     localStorage.setItem('crmfin-fbconfig', fbConfigTxt);
@@ -2246,6 +2292,7 @@
             const desconectarFirebase = async () => {
                 if (fbRef.current.unsub) { fbRef.current.unsub(); fbRef.current.unsub = null; }
                 try { await firebase.auth().signOut(); } catch (e) {}
+                // signOut encerra a sessão salva: só volta a sincronizar com senha
                 setFb({ conectado: false, email: '', erro: '' });
                 mostrarToast('☁️ Sincronização desligada — dados continuam salvos neste aparelho');
             };
@@ -5554,7 +5601,7 @@
                                         <>
                                             {fbConfigTxt && fbConfigTxt.length > 30 && (
                                                 <div className="alerta-revisao" style={{ background: 'rgba(10,132,255,0.08)', borderColor: 'rgba(10,132,255,0.3)', color: '#0A6FDB', marginBottom: '10px' }}>
-                                                    ✅ Configuração já salva{(fbConfigTxt.match(/projectId:\s*["']([^"']+)/) || [])[1] ? ' (' + fbConfigTxt.match(/projectId:\s*["']([^"']+)/)[1] + ')' : ''} — digite só a senha e conecte.
+                                                    ✅ Configuração já salva{(fbConfigTxt.match(/projectId:\s*["']([^"']+)/) || [])[1] ? ' (' + fbConfigTxt.match(/projectId:\s*["']([^"']+)/)[1] + ')' : ''} — digite a senha e conecte. Depois disso, este aparelho reconecta sozinho.
                                                 </div>
                                             )}
                                             <textarea placeholder={'Cole aqui o firebaseConfig do seu projeto, ex:\n{ apiKey: "...", authDomain: "...", projectId: "...", ... }'} value={fbConfigTxt} onChange={(e) => setFbConfigTxt(e.target.value)} />
