@@ -2144,10 +2144,15 @@
                 toastTimer.current = setTimeout(() => setToast(''), 3200);
             };
 
-            /* ── Contas recorrentes: gera as parcelas que faltam até o mês atual ── */
+            /* ── Contas recorrentes: gera as parcelas que faltam até o mês atual + 12 meses à frente ──
+               (antes só gerava até o mês corrente, então uma conta marcada como recorrente hoje só
+               aparecia nos meses seguintes quando o app fosse aberto naquele mês. Agora adianta 12
+               meses assim que a série é criada ou detectada.) */
             useEffect(() => {
                 const hoje = new Date();
-                const alvoA = hoje.getFullYear(), alvoM = hoje.getMonth() + 1;
+                const MESES_A_FRENTE = 12;
+                let alvoA = hoje.getFullYear(), alvoM = hoje.getMonth() + 1 + MESES_A_FRENTE;
+                while (alvoM > 12) { alvoM -= 12; alvoA++; }
                 let mudou = false;
                 const novo = { ...contas };
                 Object.keys(novo).forEach((emp) => {
@@ -2169,7 +2174,7 @@
                         let [a, m] = inicio.split('-').map(Number);
                         const d = diaSerie;
                         let guarda = 0;
-                        while ((a < alvoA || (a === alvoA && m < alvoM)) && guarda++ < 24) {
+                        while ((a < alvoA || (a === alvoA && m < alvoM)) && guarda++ < 60) {
                             m++; if (m > 12) { m = 1; a++; }
                             const diasNoMes = new Date(a, m, 0).getDate();
                             const venc = `${a}-${String(m).padStart(2, '0')}-${String(Math.min(d, diasNoMes)).padStart(2, '0')}`;
@@ -2192,9 +2197,12 @@
                 });
                 if (mudou) {
                     setContas(novo);
-                    mostrarToast('🔁 Contas recorrentes do mês geradas automaticamente');
+                    mostrarToast('🔁 Contas recorrentes geradas para os próximos meses');
                 }
-            }, []);
+                // Depende de [contas]: assim, assim que você marca uma conta como recorrente
+                // (o que muda `contas`), este efeito roda de novo e já adianta os 12 meses na hora,
+                // sem precisar fechar e reabrir o app. A checagem `mudou` evita loop infinito.
+            }, [contas]);
 
             /* ── Firebase: sincronização em tempo real ── */
             const parsearConfigFb = (txt) => {
@@ -2492,6 +2500,29 @@
                 return [...lista].sort((a, b) => (paraISO(a.vencimento) || '9999').localeCompare(paraISO(b.vencimento) || '9999'));
             }, [contasDoMes, filtroDia]);
 
+            /* ── Tipos/identificadores de conta (movido para cima: precisa existir ANTES da busca do Início, que o usa dentro de um useMemo — a ordem antiga causava "Cannot access before initialization" e tela branca ao pesquisar/filtrar) ── */
+            const TIPOS_BASE = [
+                { id: 'fornecedor', label: 'Fornecedor', emoji: '🏪' },
+                { id: 'cliente', label: 'Cliente / Recebimento', emoji: '💵' },
+                { id: 'socio', label: 'Sócio / Retirada', emoji: '👔' },
+                { id: 'funcionario', label: 'Funcionário', emoji: '👤' },
+                { id: 'imposto', label: 'Imposto / Governo', emoji: '🏛️' },
+                { id: 'banco', label: 'Banco / Taxa', emoji: '🏦' },
+                { id: 'outro', label: 'Outro', emoji: '📌' },
+            ];
+            const [tiposCustom, setTiposCustom] = useState(() => {
+                try { const r = localStorage.getItem('crmfin-tipos'); if (r) return JSON.parse(r); } catch (e) {}
+                return [];
+            });
+            const [novoTipo, setNovoTipo] = useState({ label: '', emoji: '' });
+            useEffect(() => { gravarLista('crmfin-tipos', tiposCustom); }, [tiposCustom]);
+
+            const TIPOS_CONTA = useMemo(() => {
+                const base = TIPOS_BASE.filter((t) => t.id !== 'outro');
+                return [...base, ...tiposCustom, TIPOS_BASE.find((t) => t.id === 'outro')];
+            }, [tiposCustom]);
+            const tipoInfo = (t) => TIPOS_CONTA.find((x) => x.id === t) || null;
+
             /* ── Busca e filtros do Início ── */
             const [buscaInicio, setBuscaInicio] = useState('');
             const [filtroInicio, setFiltroInicio] = useState('todas');
@@ -2783,6 +2814,47 @@
                 mostrarToast('↩️ Pagamento desfeito — conta pendente novamente');
             };
 
+            /* ── Entregar um arquivo ao usuário, funcionando tanto no navegador quanto no
+               app instalado (PWA standalone) no celular. Em modo standalone, `window.open`
+               com blob URL e o clique programático em `<a download>` costumam não fazer
+               nada em iOS/Android — por isso priorizamos a Web Share API (abre a folha de
+               compartilhar nativa, com opção de "Salvar em Arquivos"/"Baixar"), e só caímos
+               para o método antigo quando o compartilhamento não está disponível. ── */
+            const entregarArquivo = async (blob, nomeArquivo) => {
+                const tipo = blob.type || 'application/octet-stream';
+                const arquivo = (() => {
+                    try { return new File([blob], nomeArquivo, { type: tipo }); } catch (e) { return null; }
+                })();
+                if (arquivo && navigator.canShare && navigator.canShare({ files: [arquivo] })) {
+                    try {
+                        await navigator.share({ files: [arquivo], title: nomeArquivo });
+                        return true;
+                    } catch (e) {
+                        if (e && e.name === 'AbortError') return true; // usuário cancelou a folha de compartilhar, não é erro
+                    }
+                }
+                // Fallback: link de download tradicional (funciona bem em navegador/desktop)
+                try {
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = nomeArquivo;
+                    a.rel = 'noopener';
+                    document.body.appendChild(a);
+                    a.click();
+                    a.remove();
+                    setTimeout(() => URL.revokeObjectURL(url), 10000);
+                    return true;
+                } catch (e) { console.warn(e); }
+                // Último recurso: abrir em nova aba
+                try {
+                    const url = URL.createObjectURL(blob);
+                    window.open(url, '_blank');
+                    setTimeout(() => URL.revokeObjectURL(url), 60000);
+                    return true;
+                } catch (e) { console.warn(e); return false; }
+            };
+
             const abrirComprovante = async (c) => {
                 if (c.comprovanteDrive && c.comprovanteDrive.link) {
                     window.open(c.comprovanteDrive.link, '_blank');
@@ -2792,12 +2864,10 @@
                     try {
                         const reg = await lerArquivoIDB(c.comprovanteId);
                         if (reg && reg.blob) {
-                            const url = URL.createObjectURL(reg.blob);
-                            window.open(url, '_blank');
-                            setTimeout(() => URL.revokeObjectURL(url), 60000);
-                            return;
+                            const ok = await entregarArquivo(reg.blob, reg.nome || 'comprovante');
+                            if (ok) return;
                         }
-                    } catch (e) {}
+                    } catch (e) { console.warn(e); }
                 }
                 mostrarToast('⚠️ Comprovante não encontrado');
             };
@@ -2809,15 +2879,7 @@
                     try {
                         const reg = await lerArquivoIDB(c.boletoId);
                         if (reg && reg.blob) {
-                            const url = URL.createObjectURL(reg.blob);
-                            const a = document.createElement('a');
-                            a.href = url;
-                            a.download = reg.nome || 'boleto';
-                            document.body.appendChild(a);
-                            a.click();
-                            a.remove();
-                            setTimeout(() => URL.revokeObjectURL(url), 4000);
-                            fezAlgo = true;
+                            fezAlgo = await entregarArquivo(reg.blob, reg.nome || 'boleto');
                         }
                     } catch (e) { console.warn(e); }
                 }
@@ -3053,7 +3115,7 @@
                 exportarLista(contasDoMes, `CRM-${nomeEmpresa}-${mesStr}`);
             };
 
-            const exportarCSV = () => {
+            const exportarCSV = async () => {
                 const linhas = ['Fornecedor;Categoria;Valor;Valor Pago;Juros;Vencimento;Pago em;Status'];
                 contasDoMes.forEach((c) => linhas.push([
                     c.fornecedor, c.categoria || '', String(c.valor).replace('.', ','),
@@ -3062,10 +3124,7 @@
                     fmtData(c.vencimento), c.pagaEm ? fmtData(c.pagaEm) : '', c.status,
                 ].join(';')));
                 const blob = new Blob(['\uFEFF' + linhas.join('\n')], { type: 'text/csv;charset=utf-8' });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url; a.download = `CRM-${nomeEmpresa}.csv`; a.click();
-                setTimeout(() => URL.revokeObjectURL(url), 4000);
+                await entregarArquivo(blob, `CRM-${nomeEmpresa}.csv`);
                 mostrarToast('📋 CSV exportado');
             };
 
@@ -3216,28 +3275,6 @@
             const difDias = (a, b) => Math.abs((new Date(a + 'T12:00') - new Date(b + 'T12:00')) / 86400000);
 
             const CATEGORIAS_MOV = ['Comissões', 'Outras receitas', 'Fornecedores', 'Aluguel', 'Pessoal', 'Utilities', 'Folha', 'Seguros', 'Impostos', 'Taxas bancárias', 'Sócios/Retiradas', 'Transferências', 'Outros'];
-
-            const TIPOS_BASE = [
-                { id: 'fornecedor', label: 'Fornecedor', emoji: '🏪' },
-                { id: 'cliente', label: 'Cliente / Recebimento', emoji: '💵' },
-                { id: 'socio', label: 'Sócio / Retirada', emoji: '👔' },
-                { id: 'funcionario', label: 'Funcionário', emoji: '👤' },
-                { id: 'imposto', label: 'Imposto / Governo', emoji: '🏛️' },
-                { id: 'banco', label: 'Banco / Taxa', emoji: '🏦' },
-                { id: 'outro', label: 'Outro', emoji: '📌' },
-            ];
-            const [tiposCustom, setTiposCustom] = useState(() => {
-                try { const r = localStorage.getItem('crmfin-tipos'); if (r) return JSON.parse(r); } catch (e) {}
-                return [];
-            });
-            const [novoTipo, setNovoTipo] = useState({ label: '', emoji: '' });
-            useEffect(() => { gravarLista('crmfin-tipos', tiposCustom); }, [tiposCustom]);
-
-            const TIPOS_CONTA = useMemo(() => {
-                const base = TIPOS_BASE.filter((t) => t.id !== 'outro');
-                return [...base, ...tiposCustom, TIPOS_BASE.find((t) => t.id === 'outro')];
-            }, [tiposCustom]);
-            const tipoInfo = (t) => TIPOS_CONTA.find((x) => x.id === t) || null;
 
             const adicionarTipo = () => {
                 const label = novoTipo.label.trim();
